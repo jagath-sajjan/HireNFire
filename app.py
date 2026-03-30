@@ -6,10 +6,13 @@ Bias-Aware Hiring Screener · OpenEnv · Meta x HF Hackathon
 from __future__ import annotations
 import json, os, random
 from collections import Counter
+from typing import Optional
 
 import gradio as gr
 import plotly.graph_objects as go
 import plotly.express as px
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from hirenfire import HiringEnv, Action, ActionType
 from hirenfire.models import Candidate
@@ -528,7 +531,7 @@ HEADER = """
 
 TASK_LABELS = list(TASK_LABEL_TO_ID.keys())
 
-with gr.Blocks(title="HireNFire") as demo:
+with gr.Blocks(title="HireNFire", css=CSS) as demo:
     gr.HTML(HEADER)
 
     with gr.Tabs():
@@ -813,13 +816,77 @@ fairness = 1 − (max_rate − min_rate)</pre>
                     state_out     = gr.Code(language="json", label="Response")
                     api_state_btn.click(api_state, outputs=[state_out])
 
+# ─── FastAPI REST API (OpenEnv validator endpoints) ──────────────────────────
+# The OpenEnv platform checks POST /reset returns HTTP 200 with JSON.
+# We mount these as proper REST routes on the Gradio ASGI app.
+
+app = FastAPI()
+
+
+@app.post("/reset")
+async def rest_reset(request: Request):
+    """OpenEnv reset endpoint — POST /reset with optional {task_id: str}."""
+    try:
+        body = await request.body()
+        data = json.loads(body) if body.strip() else {}
+        task_id = data.get("task_id", "easy")
+        if task_id not in _task_map:
+            task_id = "easy"
+        env = _reset_env(task_id)
+        obs = env._make_observation()
+        return JSONResponse({
+            "status": "ok",
+            "task_id": task_id,
+            "observation": obs.model_dump(),
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/step")
+async def rest_step(request: Request):
+    """OpenEnv step endpoint — POST /step with Action JSON."""
+    try:
+        body = await request.body()
+        data = json.loads(body)
+        obs, reward, done, info = _get_env().step(Action(**data))
+        return JSONResponse({
+            "status": "ok",
+            "observation": obs.model_dump(),
+            "reward": reward.model_dump(),
+            "done": done,
+            "info": info,
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/state")
+async def rest_state():
+    """OpenEnv state endpoint — GET /state."""
+    try:
+        return JSONResponse({"status": "ok", "state": _get_env().state()})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/health")
+async def health():
+    """Health check."""
+    return JSONResponse({"status": "ok"})
+
+
+# Mount Gradio onto the FastAPI app at root
+app = gr.mount_gradio_app(app, demo, path="/")
+
+
 # ─── Launch ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import uvicorn
     _env = HiringEnv(EASY_TASK, seed=42)
     _env.reset()
-    demo.launch(
-        server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
-        server_port=int(os.getenv("GRADIO_SERVER_PORT", 7860)),
-        css=CSS,
-        share=False,
+    uvicorn.run(
+        app,
+        host=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
+        port=int(os.getenv("GRADIO_SERVER_PORT", 7860)),
     )
