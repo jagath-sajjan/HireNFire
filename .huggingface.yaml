@@ -1,0 +1,16 @@
+---
+title: HireNFire
+emoji: 🧑‍💼
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: true
+tags:
+  - openenv
+  - hiring
+  - fairness
+  - reinforcement-learning
+  - agent
+---
+
+Check out the full README at the bottom of this page.
