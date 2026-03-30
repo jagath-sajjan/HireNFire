@@ -1,4 +1,4 @@
-# 🧑‍💼 HireNFire — Bias-Aware Hiring Screener
+# HireNFire -> Bias Aware Hiring Screener
 
 > **OpenEnv Environment** where an AI agent screens resumes, conducts structured interviews, and makes hiring decisions graded on both **quality of hire** AND **demographic fairness**.
 
@@ -8,7 +8,7 @@
 
 ---
 
-## 🎯 Motivation
+## Motivation
 
 Hiring is one of the most consequential decisions organizations make. An AI agent that can assist in screening must navigate a fundamental tension:
 
@@ -22,7 +22,7 @@ This makes the environment scientifically interesting and practically relevant.
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────┐
@@ -52,7 +52,7 @@ This makes the environment scientifically interesting and practically relevant.
 
 ---
 
-## 📦 Observation Space
+## Observation Space
 
 Each observation contains:
 
@@ -79,7 +79,7 @@ Each observation contains:
 
 ---
 
-## 🎮 Action Space
+## Action Space
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
@@ -91,7 +91,7 @@ Each observation contains:
 
 ---
 
-## 📋 Tasks
+## Tasks
 
 ### Task 1: Simple Ranking (Easy)
 - **Role**: Software Engineer
@@ -116,7 +116,7 @@ Each observation contains:
 
 ---
 
-## 🚀 Setup & Usage
+## Setup & Usage
 
 ### Prerequisites
 - Python 3.11+
@@ -159,7 +159,7 @@ Tagged with `openenv`. Deploy as a Docker Space:
 
 ---
 
-## 📊 Baseline Scores
+## Baseline Scores
 
 Heuristic agent (rank by computed score → hire top-K):
 
@@ -173,16 +173,10 @@ Heuristic agent (rank by computed score → hire top-K):
 
 ---
 
-## 🔬 Why This Environment is Interesting
+## Why This Environment is Interesting
 
 1. **Genuine tradeoff**: Quality and fairness are partially conflicting objectives
 2. **Real-world relevance**: Hiring bias is a well-studied, impactful problem
 3. **Rich action space**: Multiple action types allow diverse strategies
 4. **Partial progress signals**: Intermediate rewards for good interview decisions
 5. **Configurable tension**: α parameter controls the quality–fairness tradeoff
-
----
-
-## 📄 License
-
-MIT License
