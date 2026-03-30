@@ -1,3 +1,22 @@
+---
+title: HireNFire
+emoji: 🧑‍💼
+colorFrom: gray
+colorTo: gray
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+  - reinforcement-learning
+  - hiring
+  - fairness
+  - gradio
+  - llm-evaluation
+license: mit
+short_description: Bias-aware AI hiring screener for quality and fairness
+pinned: false
+---
+
 # HireNFire -> Bias Aware Hiring Screener
 
 > **OpenEnv Environment** where an AI agent screens resumes, conducts structured interviews, and makes hiring decisions graded on both **quality of hire** AND **demographic fairness**.

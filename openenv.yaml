@@ -1,4 +1,5 @@
 name: HireNFire
+short_description: "Bias-aware AI hiring screener with fairness rewards"
 description: >
   Bias-Aware Hiring Screener — an OpenEnv environment where an AI agent
   screens resumes, conducts structured interviews, and makes hiring decisions.
