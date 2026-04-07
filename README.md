@@ -2,200 +2,201 @@
 title: HireNFire
 emoji: 🧑‍💼
 colorFrom: gray
-colorTo: gray
+colorTo: blue
 sdk: docker
 app_port: 7860
 tags:
   - openenv
-  - reinforcement-learning
   - hiring
   - fairness
-  - gradio
   - llm-evaluation
+  - simulation
 license: mit
-short_description: Bias-aware AI hiring screener for quality and fairness
+short_description: Structured hiring benchmark for quality and fairness aware agents
 pinned: false
 ---
 
-# HireNFire -> Bias Aware Hiring Screener
+# HireNFire
 
-> **OpenEnv Environment** where an AI agent screens resumes, conducts structured interviews, and makes hiring decisions graded on both **quality of hire** AND **demographic fairness**.
+HireNFire is an OpenEnv environment for structured hiring decisions. An agent reviews candidate resumes, decides who to interview, and finalizes a hiring cohort. The benchmark is designed around a real operational tradeoff: picking strong candidates while keeping the final slate aligned with the applicant-pool mix.
 
-[![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-brightgreen)](https://github.com/openenv)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+The environment is intentionally not a toy ranking task. Resumes are noisy, some candidates outperform their paper profile in interviews, some polished resumes overstate fit, and the hard task forces the agent to use interviews to recover hidden upside rather than greedily hiring the most keyword-matched applicants.
 
----
+## Why This Environment Exists
 
-## Motivation
+Real recruiting teams do more than sort resumes by keyword overlap. They:
 
-Hiring is one of the most consequential decisions organizations make. An AI agent that can assist in screening must navigate a fundamental tension:
+- screen a pipeline with incomplete information
+- decide where to spend scarce interview bandwidth
+- balance candidate quality against cohort-level fairness goals
+- avoid over-indexing on polished but misleading resumes
 
-**`reward = α · quality + (1 − α) · fairness`**
+HireNFire packages that workflow into a deterministic, typed OpenEnv benchmark that is usable for RL, planning agents, and LLM evaluation.
 
-- Optimizing purely for the "best" candidate often produces **demographic skew**
-- Optimizing for demographic parity alone produces **weaker hires**
-- The agent must learn to **balance both objectives simultaneously**
+## Core API
 
-This makes the environment scientifically interesting and practically relevant.
+The environment implements the standard OpenEnv simulation contract:
 
----
+- `reset() -> Observation`
+- `step(action) -> (observation, reward, done, info)`
+- `state() -> dict`
 
-## Architecture
+Typed models live in [`hirenfire/models.py`](/Users/jagath-sajjan/HireNFire/hirenfire/models.py). Runtime endpoints are exposed from [`app.py`](/Users/jagath-sajjan/HireNFire/app.py):
 
-```
-┌─────────────────────────────────────────┐
-│            Agent (LLM via OpenAI)       │
-└──────────────────┬──────────────────────┘
-                   │ action
-                   ▼
-┌─────────────────────────────────────────┐
-│         step(action) → obs, reward,     │──→ Reward Grader
-│                        done, info       │
-└──────────────────┬──────────────────────┘
-                   ▼
-┌─────────────────────────────────────────┐
-│                 State                    │
-│  ┌──────────┐ ┌───────────┐ ┌────────┐ │
-│  │Candidate │ │ Decision  │ │ Task   │ │
-│  │  Pool    │ │   Log     │ │ Config │ │
-│  └──────────┘ └───────────┘ └────────┘ │
-└──────────────────┬──────────────────────┘
-                   ▼
-     ┌─────────┐ ┌──────────┐ ┌───────────┐
-     │Quality  │ │Fairness  │ │  Final    │
-     │Score    │ │Score     │ │  Reward   │
-     │P/R      │ │Parity   │ │α·Q+(1-α)·F│
-     └─────────┘ └──────────┘ └───────────┘
-```
-
----
+- `POST /reset`
+- `POST /step`
+- `GET /state`
+- `GET /health`
+- `GET /metadata`
+- `GET /schema`
+- `POST /mcp`
 
 ## Observation Space
 
 Each observation contains:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `candidates` | `list[Candidate]` | Pool of candidates with resumes |
-| `current_step` | `int` | Current step in the episode |
-| `task_config` | `TaskConfig` | Role, difficulty, alpha |
-| `decisions` | `list[dict]` | Actions taken so far |
-| `remaining_slots` | `int` | How many hires left to make |
-| `interview_results` | `dict` | Results from conducted interviews |
+- visible candidate cards with experience, skills, education, demographic group, certifications, strengths, concerns, and a resume summary
+- any interview scores revealed so far
+- remaining slots and remaining candidates
+- prior decision records
+- fairness targets derived from the current applicant pool
+- a recent event string summarizing the last state change
 
-### Candidate Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `int` | Unique identifier |
-| `name` | `str` | Candidate name |
-| `years_experience` | `int` | Years of relevant experience |
-| `skills` | `list[str]` | Technical skills |
-| `education` | `str` | Education level |
-| `demographic_group` | `str` | Abstract group (A/B/C/D) |
-| `interview_score` | `float \| None` | Revealed only after INTERVIEW |
-
----
+Candidate cards intentionally expose enough signal for a strong policy without leaking the hidden grader fields.
 
 ## Action Space
 
-| Action | Parameters | Description |
-|--------|-----------|-------------|
-| `RANK` | — | Request a ranking of all candidates by agent's criteria |
-| `INTERVIEW` | `candidate_id` | Conduct a structured interview (reveals hidden score) |
-| `HIRE` | `candidate_id`, `reasoning` | Hire a specific candidate |
-| `REJECT` | `candidate_id`, `reasoning` | Reject a specific candidate |
-| `FINALIZE` | — | End the episode and compute final scores |
+The agent can take five actions:
 
----
+- `RANK`: request a resume-only ranking snapshot
+- `INTERVIEW(candidate_id)`: reveal structured interview signal for one candidate
+- `HIRE(candidate_id)`: add a candidate to the final slate
+- `REJECT(candidate_id)`: remove a candidate from consideration
+- `FINALIZE`: end the episode and score the slate
+
+## Reward Design
+
+Final reward follows:
+
+`reward = alpha * quality_score + (1 - alpha) * fairness_score`
+
+`quality_score`
+- cohort value of the selected hires divided by the optimal fully-staffed cohort value
+
+`fairness_score`
+- similarity between selected group counts and pool-proportional target counts
+
+Partial rewards are emitted on every step. They add signal for:
+
+- interviewing high-priority ambiguous candidates
+- building a strong partial slate
+- keeping partial group mix on track
+
+They also penalize:
+
+- invalid actions
+- rejecting too many priority candidates
+- wasting steps
+
+Implementation lives in [`hirenfire/graders.py`](/Users/jagath-sajjan/HireNFire/hirenfire/graders.py).
 
 ## Tasks
 
-### Task 1: Simple Ranking (Easy)
-- **Role**: Software Engineer
-- **Candidates**: 10 with clear skill gaps
-- **α = 0.7** (quality weighted)
-- **Goal**: Rank and hire the top candidates by explicit criteria
-- **Expected Score**: 0.7–0.9
+### Easy: `simple-screen`
 
-### Task 2: High-Potential Screening (Medium)
-- **Role**: Data Scientist
-- **Candidates**: 25, some underqualified but high potential
-- **α = 0.5** (balanced)
-- **Goal**: Balance strict criteria with potential; maintain fairness
-- **Expected Score**: 0.5–0.7
+- Role: Software Engineer
+- Pool: 10 candidates
+- Hires: 3
+- Alpha: `0.72`
+- Shape: mostly clear resume signals with a few borderline candidates
 
-### Task 3: Fair Hiring at Scale (Hard)
-- **Role**: Senior ML Engineer
-- **Candidates**: 50 with demographic skew and tight margins
-- **α = 0.3** (fairness weighted)
-- **Goal**: Maintain demographic parity while hiring quality candidates
-- **Expected Score**: 0.3–0.6
+### Medium: `potential-calibration`
 
----
+- Role: Data Scientist
+- Pool: 25 candidates
+- Hires: 5
+- Alpha: `0.55`
+- Shape: career switchers and under-credentialed applicants can outperform in interviews
 
-## Setup & Usage
+### Hard: `fair-panel-hiring`
 
-### Prerequisites
-- Python 3.11+
-- OpenAI API key (for baseline inference)
+- Role: Senior ML Engineer
+- Pool: 50 candidates
+- Hires: 8
+- Alpha: `0.38`
+- Shape: skewed pipeline, more polished false positives, and hidden-upside candidates that are hard to find without interviews
 
-### Installation
+Task definitions live in [`hirenfire/tasks.py`](/Users/jagath-sajjan/HireNFire/hirenfire/tasks.py). Candidate generation logic lives in [`hirenfire/generator.py`](/Users/jagath-sajjan/HireNFire/hirenfire/generator.py).
 
-```bash
-# Clone or download
-cd HireNFire
+## Baselines
 
-# Install dependencies
-pip install -r requirements.txt
+Two baseline runners are included:
 
-# Set API key (for baseline inference only)
-export OPENAI_API_KEY="your-key-here"
-```
+- [`demo.py`](/Users/jagath-sajjan/HireNFire/demo.py): deterministic heuristic sanity check
+- [`inference.py`](/Users/jagath-sajjan/HireNFire/inference.py): evaluator-facing baseline runner using the OpenAI client and strict structured stdout logs
 
-### Run the Notebook
+Current deterministic heuristic sanity-check scores with seed `42`:
 
-```bash
-jupyter notebook HireNFire.ipynb
-```
+| Task | Quality | Fairness | Combined |
+|------|---------|----------|----------|
+| `simple-screen` | `0.9763` | `0.3333` | `0.7963` |
+| `potential-calibration` | `0.9777` | `0.6000` | `0.8077` |
+| `fair-panel-hiring` | `0.9959` | `0.7500` | `0.8434` |
 
-### Docker
+These are sanity-check numbers, not a ceiling for stronger LLM or planning agents.
 
-```bash
-docker build -t hirenfire .
-docker run -p 8888:8888 hirenfire
-```
+## Inference Script Requirements
 
-### Hugging Face Spaces
+`inference.py`:
 
-Tagged with `openenv`. Deploy as a Docker Space:
+- reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` or `OPENAI_API_KEY`
+- uses the OpenAI client for model calls when credentials are present
+- emits only the required `[START]`, `[STEP]`, and `[END]` lines to stdout
+- falls back to a deterministic heuristic policy when no API key is available
+
+Example:
 
 ```bash
-# Push to HF Spaces
-# Tag: openenv
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+export HF_TOKEN="your-token"
+python inference.py
 ```
 
----
+## Local Development
 
-## Baseline Scores
+Install dependencies:
 
-Heuristic agent (rank by computed score → hire top-K):
+```bash
+python -m pip install -r requirements.txt
+```
 
-| Task | Quality | Fairness | Combined | α |
-|------|---------|----------|----------|---|
-| Easy | ~0.90 | ~0.75 | ~0.86 | 0.7 |
-| Medium | ~0.70 | ~0.60 | ~0.65 | 0.5 |
-| Hard | ~0.65 | ~0.45 | ~0.51 | 0.3 |
+Run the app locally:
 
-*Scores are approximate and will vary slightly due to random candidate generation.*
+```bash
+python -m uvicorn app:app --host 0.0.0.0 --port 7860
+```
 
----
+Run validation:
 
-## Why This Environment is Interesting
+```bash
+openenv validate
+openenv validate --url http://127.0.0.1:7860
+```
 
-1. **Genuine tradeoff**: Quality and fairness are partially conflicting objectives
-2. **Real-world relevance**: Hiring bias is a well-studied, impactful problem
-3. **Rich action space**: Multiple action types allow diverse strategies
-4. **Partial progress signals**: Intermediate rewards for good interview decisions
-5. **Configurable tension**: α parameter controls the quality–fairness tradeoff
+Run the deterministic baseline:
+
+```bash
+python demo.py
+```
+
+## Docker / Hugging Face Spaces
+
+The repository includes:
+
+- [`Dockerfile`](/Users/jagath-sajjan/HireNFire/Dockerfile)
+- [`openenv.yaml`](/Users/jagath-sajjan/HireNFire/openenv.yaml)
+- [`server/app.py`](/Users/jagath-sajjan/HireNFire/server/app.py)
+- [`pyproject.toml`](/Users/jagath-sajjan/HireNFire/pyproject.toml)
+
+The container installs the package directly from the repository and launches the ASGI app on port `7860`, which matches Hugging Face Spaces expectations.

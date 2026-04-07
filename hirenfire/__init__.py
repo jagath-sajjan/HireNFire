@@ -1,19 +1,29 @@
 """
-HireNFire — Bias-Aware Hiring Screener OpenEnv Environment
-
-An AI agent screens resumes, conducts structured interviews, and makes
-hiring decisions — graded on both quality of hire AND demographic fairness.
-
-reward = α · quality + (1 − α) · fairness
+HireNFire — structured hiring benchmark for OpenEnv.
 """
 
-from hirenfire.models import Candidate, TaskConfig, Observation, Action, ActionType, RewardInfo
+from hirenfire.models import (
+    Action,
+    ActionType,
+    Candidate,
+    EnvironmentState,
+    Observation,
+    RewardInfo,
+    TaskConfig,
+)
 from hirenfire.env import HiringEnv
-from hirenfire.tasks import EASY_TASK, MEDIUM_TASK, HARD_TASK, ALL_TASKS
+from hirenfire.tasks import ALL_TASKS, EASY_TASK, HARD_TASK, MEDIUM_TASK, TASK_BY_ID
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
-    "Candidate", "TaskConfig", "Observation", "Action", "ActionType", "RewardInfo",
+    "Candidate",
+    "TaskConfig",
+    "Observation",
+    "EnvironmentState",
+    "Action",
+    "ActionType",
+    "RewardInfo",
     "HiringEnv",
     "EASY_TASK", "MEDIUM_TASK", "HARD_TASK", "ALL_TASKS",
+    "TASK_BY_ID",
 ]

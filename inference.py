@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-inference.py — HireNFire LLM Baseline Inference Script
+Baseline inference runner for HireNFire.
 
-Runs an LLM agent via the OpenAI client against all 3 tasks and produces
-reproducible baseline scores. Required environment variables:
+This script intentionally emits only the structured stdout lines required by
+the evaluator:
 
-    API_BASE_URL   The API endpoint for the LLM
-    MODEL_NAME     The model identifier to use
-    HF_TOKEN       Your Hugging Face / API key
-
-Usage:
-    export API_BASE_URL="https://api.openai.com/v1"
-    export MODEL_NAME="gpt-4o-mini"
-    export HF_TOKEN="your-api-key"
-    python inference.py
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END] success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 from __future__ import annotations
@@ -21,207 +15,289 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
+from collections import Counter
+from typing import Optional
 
 try:
     from openai import OpenAI
 except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai")
-    sys.exit(1)
+    OpenAI = None
 
-from hirenfire import HiringEnv, Action, ActionType
+from demo import visible_candidate_score
+from hirenfire import Action, ActionType, HiringEnv
+from hirenfire.models import CandidateView, Observation
 from hirenfire.tasks import ALL_TASKS
-from hirenfire.models import TaskConfig
 
-# ── Read credentials from environment ────────────────────────────────────
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY", "")
 
-if not HF_TOKEN:
-    print("⚠ WARNING: HF_TOKEN / OPENAI_API_KEY not set.")
-    print("  Running heuristic fallback instead of LLM inference.\n")
-
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or ""
+BENCHMARK = "hirenfire"
 SEED = 42
+TEMPERATURE = 0.0
+MAX_TOKENS = 220
+SUCCESS_SCORE_THRESHOLD = 0.50
 
-# ── Prompts ───────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are deciding hiring actions in a structured hiring environment.
 
-SYSTEM_PROMPT = """You are a fair and skilled hiring assistant AI agent.
-
-You screen candidates for job roles. Your goal is to BOTH:
-1. QUALITY: hire the most qualified candidates (skills, experience, education match)
-2. FAIRNESS: ensure demographic parity — hire proportionally from groups A, B, C, D
-
-You receive observations and must output a single JSON action:
-  {"action_type": "INTERVIEW", "candidate_id": <int>, "reasoning": "<str>"}
-  {"action_type": "HIRE",      "candidate_id": <int>, "reasoning": "<str>"}
-  {"action_type": "REJECT",    "candidate_id": <int>, "reasoning": "<str>"}
-  {"action_type": "FINALIZE",  "reasoning": "<str>"}
+Return exactly one JSON object with one of these forms:
+{"action_type":"INTERVIEW","candidate_id":12,"reasoning":"..."}
+{"action_type":"HIRE","candidate_id":12,"reasoning":"..."}
+{"action_type":"REJECT","candidate_id":12,"reasoning":"..."}
+{"action_type":"FINALIZE","reasoning":"..."}
 
 Rules:
-- INTERVIEW a candidate first to see their interview score before deciding
-- Track which demographic groups you hire from — aim for proportional representation
-- FINALIZE when all slots are filled or you have screened enough candidates
-- Output ONLY valid JSON. No markdown, no extra text.
-
-Strategy: Interview top candidates from each group → hire best per slot → FINALIZE."""
+- Prefer interviewing ambiguous high-value candidates before hiring.
+- Use fairness_targets and current group counts when choosing the final cohort.
+- Never output markdown or explanations outside JSON.
+"""
 
 
-def _format_obs(obs) -> str:
-    cfg = obs.task_config
+def _debug(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_value = (error or "null").replace("\n", " ")
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error_value}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+def _action_string(action: Action) -> str:
+    if action.candidate_id is None:
+        return f"{action.action_type.value.lower()}()"
+    return f"{action.action_type.value.lower()}({action.candidate_id})"
+
+
+def _candidate_priority(
+    candidate: CandidateView,
+    observation: Observation,
+) -> float:
+    base = visible_candidate_score(candidate, observation.task_config.required_skills)
+    current_counts = Counter(
+        next(item.demographic_group for item in observation.candidates if item.id == candidate_id)
+        for candidate_id in observation.hired_ids
+    )
+    target_gap = max(
+        observation.fairness_targets.get(candidate.demographic_group, 0)
+        - current_counts.get(candidate.demographic_group, 0),
+        0,
+    )
+    interview_bonus = 0.07 if candidate.interview_score is None else 0.0
+    concern_bonus = 0.04 * sum(
+        1
+        for concern in candidate.concerns
+        if "gap" in concern.lower() or "limited" in concern.lower() or "undersells" in concern.lower()
+    )
+    return round(base + 0.06 * target_gap + interview_bonus + concern_bonus, 4)
+
+
+def _available_candidates(observation: Observation) -> list[CandidateView]:
+    excluded = set(observation.hired_ids) | set(observation.rejected_ids)
+    return [candidate for candidate in observation.candidates if candidate.id not in excluded]
+
+
+def _shortlist(observation: Observation, limit: int = 8) -> list[CandidateView]:
+    candidates = _available_candidates(observation)
+    return sorted(candidates, key=lambda candidate: _candidate_priority(candidate, observation), reverse=True)[:limit]
+
+
+def _heuristic_action(observation: Observation) -> Action:
+    shortlist = _shortlist(observation, limit=10)
+    if not shortlist or observation.remaining_slots <= 0:
+        return Action(action_type=ActionType.FINALIZE, reasoning="No remaining useful actions.")
+
+    interview_budget = observation.task_config.interview_budget_hint
+    interviewed = len(observation.interview_results)
+    interview_candidates = [candidate for candidate in shortlist if candidate.interview_score is None]
+
+    if interviewed < interview_budget and interview_candidates:
+        target = max(interview_candidates, key=lambda candidate: _candidate_priority(candidate, observation))
+        return Action(
+            action_type=ActionType.INTERVIEW,
+            candidate_id=target.id,
+            reasoning="Calibrate a high-priority candidate before final selection.",
+        )
+
+    current_counts = Counter(
+        next(item.demographic_group for item in observation.candidates if item.id == candidate_id)
+        for candidate_id in observation.hired_ids
+    )
+    best_candidate = None
+    best_score = -1.0
+    for candidate in shortlist:
+        quality = visible_candidate_score(candidate, observation.task_config.required_skills)
+        group_gap = max(
+            observation.fairness_targets.get(candidate.demographic_group, 0)
+            - current_counts.get(candidate.demographic_group, 0),
+            0,
+        )
+        score = quality + 0.08 * group_gap
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return Action(action_type=ActionType.FINALIZE, reasoning="No viable candidates remain.")
+
+    return Action(
+        action_type=ActionType.HIRE,
+        candidate_id=best_candidate.id,
+        reasoning=f"Best visible score after fairness-aware tie-break ({best_score:.3f}).",
+    )
+
+
+def _parse_model_action(text: str) -> Optional[Action]:
+    try:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            cleaned = "\n".join(lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:])
+        return Action(**json.loads(cleaned))
+    except Exception:
+        return None
+
+
+def _build_user_prompt(observation: Observation) -> str:
+    current_counts = Counter(
+        next(item.demographic_group for item in observation.candidates if item.id == candidate_id)
+        for candidate_id in observation.hired_ids
+    )
+    shortlist = _shortlist(observation)
     lines = [
-        f"TASK: {cfg.task_name} | Role: {cfg.role}",
-        f"Required Skills: {', '.join(cfg.required_skills)}",
-        f"Slots remaining: {obs.remaining_slots} | Step: {obs.current_step}/{cfg.max_steps}",
-        f"Hired IDs: {obs.hired_ids} | Rejected IDs: {obs.rejected_ids}",
-        "",
-        "CANDIDATES (ID | Name | Group | Education | Exp | Skills | InterviewScore | Status):",
+        f"task={observation.task_config.task_id}",
+        f"role={observation.task_config.role}",
+        f"remaining_slots={observation.remaining_slots}",
+        f"current_step={observation.current_step}",
+        f"fairness_targets={json.dumps(observation.fairness_targets, sort_keys=True)}",
+        f"current_group_hires={json.dumps(dict(current_counts), sort_keys=True)}",
+        f"recent_event={observation.recent_event}",
+        "shortlist:",
     ]
-    for c in obs.candidates:
-        if c.id in obs.hired_ids:
-            status = "HIRED"
-        elif c.id in obs.rejected_ids:
-            status = "REJECTED"
-        else:
-            status = "pending"
-        int_sc = f"{c.interview_score:.2f}" if c.interview_score is not None else "unknown"
-        skills_str = ", ".join(c.skills[:5])
+    for candidate in shortlist:
         lines.append(
-            f"  [{c.id}] {c.name} | Grp:{c.demographic_group} | {c.education} | "
-            f"{c.years_experience}yr | {skills_str} | IntScore:{int_sc} | {status}"
+            json.dumps(
+                {
+                    "id": candidate.id,
+                    "group": candidate.demographic_group,
+                    "experience": candidate.years_experience,
+                    "education": candidate.education,
+                    "skills": candidate.skills[:5],
+                    "strengths": candidate.strengths[:2],
+                    "concerns": candidate.concerns[:2],
+                    "interview_score": candidate.interview_score,
+                    "resume_summary": candidate.resume_summary,
+                },
+                sort_keys=True,
+            )
         )
     return "\n".join(lines)
 
 
-def _parse_action(text: str) -> Action:
-    """Parse LLM output into an Action. Falls back to FINALIZE on error."""
+def _llm_action(client: OpenAI, observation: Observation) -> Action:
+    heuristic = _heuristic_action(observation)
     try:
-        clean = text.strip()
-        # Strip markdown code fences
-        if clean.startswith("```"):
-            lines = clean.split("\n")
-            clean = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        data = json.loads(clean)
-        return Action(**data)
-    except Exception:
-        return Action(action_type=ActionType.FINALIZE, reasoning="Parse fallback")
-
-
-def run_llm_task(client: OpenAI, task_config: TaskConfig) -> dict:
-    """Run one task episode with the LLM agent. Returns final reward dict."""
-    env = HiringEnv(task_config, seed=SEED)
-    obs = env.reset()
-
-    print(f"\n{'─'*58}")
-    print(f"  📋 {task_config.task_name} ({task_config.difficulty.value.upper()})")
-    print(f"  Candidates: {task_config.num_candidates} | Hire: {task_config.num_to_hire} | α={task_config.alpha}")
-    print(f"{'─'*58}")
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    done = False
-
-    for step_num in range(task_config.max_steps):
-        user_content = _format_obs(obs)
-        messages.append({"role": "user", "content": user_content})
-
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=256,
-            )
-            reply = response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"  ⚠ API error step {step_num + 1}: {e}")
-            reply = '{"action_type": "FINALIZE", "reasoning": "API error"}'
-
-        messages.append({"role": "assistant", "content": reply})
-        action = _parse_action(reply)
-
-        obs, reward, done, info = env.step(action)
-        cid_str = f" → candidate {action.candidate_id}" if action.candidate_id is not None else ""
-        print(f"  Step {step_num + 1:2d}: {action.action_type.value}{cid_str}")
-
-        if done:
-            break
-        # Small delay to respect rate limits
-        time.sleep(0.1)
-
-    if not done:
-        obs, reward, done, _ = env.step(Action(action_type=ActionType.FINALIZE))
-
-    state = env.state()
-    r = state["final_reward"]
-    print(f"\n  Quality:   {r['quality_score']:.4f}")
-    print(f"  Fairness:  {r['fairness_score']:.4f}")
-    print(f"  Combined:  {r['combined_reward']:.4f}  ({r['breakdown'].get('formula','')})")
-    print(f"  Hired:     {state['hired_ids']}")
-    return r
-
-
-def run_heuristic_fallback() -> list[dict]:
-    """Run heuristic agent when no API key is available."""
-    from demo import heuristic_agent
-    results = []
-    for task in ALL_TASKS:
-        env = HiringEnv(task, seed=SEED)
-        state = heuristic_agent(env)
-        r = state["final_reward"]
-        print(f"  {task.task_name:<28} Q={r['quality_score']:.4f}  F={r['fairness_score']:.4f}  Combined={r['combined_reward']:.4f}")
-        results.append(r)
-    return results
-
-
-def main():
-    print("=" * 58)
-    print("  🧑‍💼 HireNFire — Inference Script")
-    print(f"  Model:    {MODEL_NAME}")
-    print(f"  API URL:  {API_BASE_URL}")
-    print(f"  Seed:     {SEED}")
-    print("=" * 58)
-
-    if not HF_TOKEN:
-        print("\n⚠ No API key — running heuristic baseline:\n")
-        results = run_heuristic_fallback()
-    else:
-        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-        results = []
-        for task in ALL_TASKS:
-            r = run_llm_task(client, task)
-            results.append(r)
-
-    # Final summary table
-    print(f"\n{'='*58}")
-    print("  📊 BASELINE SUMMARY")
-    print(f"{'='*58}")
-    print(f"  {'Task':<28} {'α':>4} {'Q':>7} {'F':>7} {'Combined':>9}")
-    print(f"  {'-'*28} {'-'*4} {'-'*7} {'-'*7} {'-'*9}")
-    for task, r in zip(ALL_TASKS, results):
-        print(
-            f"  {task.task_name:<28} {task.alpha:>4.1f} "
-            f"{r['quality_score']:>7.4f} {r['fairness_score']:>7.4f} {r['combined_reward']:>9.4f}"
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _build_user_prompt(observation)},
+            ],
         )
+        content = (response.choices[0].message.content or "").strip()
+        parsed = _parse_model_action(content)
+        if parsed is None:
+            return heuristic
+        available_ids = {candidate.id for candidate in _available_candidates(observation)}
+        if parsed.action_type in {ActionType.INTERVIEW, ActionType.HIRE, ActionType.REJECT} and parsed.candidate_id not in available_ids:
+            return heuristic
+        return parsed
+    except Exception as exc:
+        _debug(f"[DEBUG] Model request failed: {exc}")
+        return heuristic
 
-    # Machine-readable output for validators
-    output = {
-        "model": MODEL_NAME,
-        "seed": SEED,
-        "results": [
-            {
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "difficulty": task.difficulty.value,
-                "alpha": task.alpha,
-                "quality_score": r["quality_score"],
-                "fairness_score": r["fairness_score"],
-                "combined_reward": r["combined_reward"],
-            }
-            for task, r in zip(ALL_TASKS, results)
-        ]
-    }
-    print(f"\n📄 JSON Results:")
-    print(json.dumps(output, indent=2))
+
+def run_task(task, client: Optional[OpenAI]) -> float:
+    env = HiringEnv(task, seed=SEED)
+    observation = env.reset()
+    rewards: list[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+
+    log_start(task=task.task_id, env=BENCHMARK, model=MODEL_NAME)
+
+    try:
+        for step in range(1, task.max_steps + 1):
+            if client is not None:
+                action = _llm_action(client, observation)
+            else:
+                action = _heuristic_action(observation)
+
+            observation, reward, done, info = env.step(action)
+            rewards.append(reward.combined_reward)
+            steps_taken = step
+            log_step(
+                step=step,
+                action=_action_string(action),
+                reward=reward.combined_reward,
+                done=done,
+                error=info.get("error"),
+            )
+            if done:
+                break
+
+        if not env.state()["done"]:
+            final_action = Action(action_type=ActionType.FINALIZE, reasoning="Reached planner stop condition.")
+            observation, reward, done, info = env.step(final_action)
+            rewards.append(reward.combined_reward)
+            steps_taken += 1
+            log_step(
+                step=steps_taken,
+                action=_action_string(final_action),
+                reward=reward.combined_reward,
+                done=done,
+                error=info.get("error"),
+            )
+
+        final_state = env.state()
+        final_reward = final_state.get("final_reward") or {}
+        score = float(final_reward.get("combined_reward", rewards[-1] if rewards else 0.0))
+        success = score >= SUCCESS_SCORE_THRESHOLD
+        return score
+    except Exception as exc:
+        _debug(f"[DEBUG] Task {task.task_id} failed: {exc}")
+        return score
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+
+def main() -> None:
+    client: Optional[OpenAI] = None
+    if API_KEY and OpenAI is not None:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    elif API_KEY and OpenAI is None:
+        _debug("[DEBUG] openai package unavailable, falling back to heuristic policy.")
+
+    for task in ALL_TASKS:
+        run_task(task, client)
 
 
 if __name__ == "__main__":

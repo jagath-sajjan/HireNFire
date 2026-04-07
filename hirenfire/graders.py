@@ -1,19 +1,65 @@
 """
-Graders for the HireNFire environment.
+Graders and reward shaping for HireNFire.
 
-Quality grader: Precision/recall of hire decisions vs ground-truth top-K.
-Fairness grader: Demographic parity of hire decisions across groups.
-Combined: reward = α * quality + (1 - α) * fairness
+Final score:
+    reward = alpha * quality + (1 - alpha) * fairness
+
+Intermediate rewards add process signal for interviewing the right candidates,
+avoiding invalid actions, and not rejecting high-value applicants too early.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from typing import Optional
-
-import numpy as np
 
 from hirenfire.models import Candidate, RewardInfo
+
+
+def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def _candidate_lookup(candidates: list[Candidate]) -> dict[int, Candidate]:
+    return {candidate.id: candidate for candidate in candidates}
+
+
+def _unique_existing_ids(candidates: list[Candidate], candidate_ids: list[int]) -> list[int]:
+    lookup = _candidate_lookup(candidates)
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for candidate_id in candidate_ids:
+        if candidate_id in lookup and candidate_id not in seen:
+            seen.add(candidate_id)
+            ordered.append(candidate_id)
+    return ordered
+
+
+def target_group_hires(candidates: list[Candidate], num_to_hire: int) -> dict[str, int]:
+    """Allocate target cohort counts by applicant-pool proportions."""
+
+    groups = sorted({candidate.demographic_group for candidate in candidates})
+    if num_to_hire <= 0 or not groups:
+        return {group: 0 for group in groups}
+
+    pool_counts = Counter(candidate.demographic_group for candidate in candidates)
+    total_pool = sum(pool_counts.values()) or 1
+
+    raw_targets = {
+        group: (pool_counts[group] / total_pool) * num_to_hire
+        for group in groups
+    }
+    targets = {group: int(raw_targets[group]) for group in groups}
+    remaining = num_to_hire - sum(targets.values())
+
+    remainders = sorted(
+        groups,
+        key=lambda group: (raw_targets[group] - targets[group], pool_counts[group]),
+        reverse=True,
+    )
+    for group in remainders[:remaining]:
+        targets[group] += 1
+
+    return targets
 
 
 def quality_score(
@@ -22,84 +68,59 @@ def quality_score(
     num_to_hire: int,
 ) -> float:
     """
-    Compute quality of hire as precision/recall against ground truth top-K.
+    Score hire quality as achieved cohort value vs the optimal cohort value.
 
-    Ground truth top-K = the `num_to_hire` candidates with highest ground_truth_score.
-    Quality = F1 score of the agent's hires vs the ideal hires.
+    This is smoother than an exact top-K match and better reflects real hiring:
+    a near-optimal cohort still gets credit, while under-hiring is naturally
+    penalized because the selected cohort value is compared against the best
+    possible fully staffed cohort.
     """
-    if not hired_ids:
+
+    if num_to_hire <= 0 or not candidates or not hired_ids:
         return 0.0
 
-    # Ground truth: top-K by ground_truth_score
-    sorted_candidates = sorted(candidates, key=lambda c: c.ground_truth_score, reverse=True)
-    ideal_ids = set(c.id for c in sorted_candidates[:num_to_hire])
-    hired_set = set(hired_ids)
-
-    # Precision: what fraction of hires are in the ideal set
-    true_positives = len(hired_set & ideal_ids)
-    precision = true_positives / len(hired_set) if hired_set else 0.0
-
-    # Recall: what fraction of ideal candidates were hired
-    recall = true_positives / len(ideal_ids) if ideal_ids else 0.0
-
-    # F1
-    if precision + recall == 0:
+    unique_hires = _unique_existing_ids(candidates, hired_ids)
+    lookup = _candidate_lookup(candidates)
+    selected_total = sum(lookup[candidate_id].ground_truth_score for candidate_id in unique_hires)
+    optimal_total = sum(
+        candidate.ground_truth_score
+        for candidate in sorted(candidates, key=lambda item: item.ground_truth_score, reverse=True)[:num_to_hire]
+    )
+    if optimal_total <= 0:
         return 0.0
-
-    f1 = 2 * (precision * recall) / (precision + recall)
-    return round(float(f1), 4)
+    return round(_clamp(selected_total / optimal_total), 4)
 
 
 def fairness_score(
     candidates: list[Candidate],
     hired_ids: list[int],
+    num_to_hire: int | None = None,
 ) -> float:
     """
-    Compute demographic parity of hiring decisions.
+    Score fairness by comparing selected group counts to the target cohort mix.
 
-    Measures how evenly hires are distributed across demographic groups
-    relative to the applicant pool composition.
-
-    Perfect parity (1.0) = hire rate is identical across all groups.
-    Worst case (0.0) = all hires from a single group when pool is balanced.
+    The target mix is derived from the applicant pool via largest-remainder
+    rounding. The metric is strict enough that hiring everyone from the same
+    group scores poorly, while small deviations are penalized proportionally.
     """
-    if not hired_ids:
+
+    if not candidates or not hired_ids:
         return 0.0
 
-    hired_set = set(hired_ids)
-
-    # Count applicants and hires per group
-    pool_counts: Counter = Counter()
-    hire_counts: Counter = Counter()
-
-    for c in candidates:
-        pool_counts[c.demographic_group] += 1
-        if c.id in hired_set:
-            hire_counts[c.demographic_group] += 1
-
-    # Compute hire rate per group
-    groups_present = list(pool_counts.keys())
-    if len(groups_present) <= 1:
-        return 1.0  # Only one group, parity is trivially satisfied
-
-    hire_rates = []
-    for g in groups_present:
-        pool_n = pool_counts[g]
-        hired_n = hire_counts.get(g, 0)
-        rate = hired_n / pool_n if pool_n > 0 else 0.0
-        hire_rates.append(rate)
-
-    # Parity metric: 1 - (max_rate - min_rate)
-    # This is the "demographic parity distance"
-    max_rate = max(hire_rates)
-    min_rate = min(hire_rates)
-
-    if max_rate == 0:
+    effective_hires = len(_unique_existing_ids(candidates, hired_ids))
+    target_size = num_to_hire if num_to_hire is not None else effective_hires
+    if target_size <= 0:
         return 0.0
 
-    # Normalize: 1.0 when all rates equal, 0.0 when max disparity
-    parity = 1.0 - (max_rate - min_rate)
-    return round(float(np.clip(parity, 0.0, 1.0)), 4)
+    targets = target_group_hires(candidates, target_size)
+    selected_counts = Counter(
+        _candidate_lookup(candidates)[candidate_id].demographic_group
+        for candidate_id in _unique_existing_ids(candidates, hired_ids)
+    )
+    deviation = sum(abs(selected_counts.get(group, 0) - targets.get(group, 0)) for group in targets)
+    fill_ratio = min(effective_hires / target_size, 1.0)
+    mix_score = 1.0 - min(deviation / target_size, 1.0)
+    return round(_clamp(mix_score * fill_ratio), 4)
 
 
 def compute_reward(
@@ -107,31 +128,38 @@ def compute_reward(
     hired_ids: list[int],
     num_to_hire: int,
     alpha: float,
-    extra_info: Optional[dict] = None,
+    extra_info: dict | None = None,
 ) -> RewardInfo:
-    """
-    Compute the combined reward: α * quality + (1 - α) * fairness.
+    """Compute the final task reward."""
 
-    Args:
-        candidates: Full candidate pool with ground truth scores
-        hired_ids: List of hired candidate IDs
-        num_to_hire: Target number of hires
-        alpha: Weight for quality (1-alpha for fairness)
-        extra_info: Optional additional info for the breakdown
-
-    Returns:
-        RewardInfo with quality, fairness, and combined scores
-    """
     q = quality_score(candidates, hired_ids, num_to_hire)
-    f = fairness_score(candidates, hired_ids)
-    combined = alpha * q + (1.0 - alpha) * f
+    f = fairness_score(candidates, hired_ids, num_to_hire=num_to_hire)
+    combined = _clamp(alpha * q + (1.0 - alpha) * f)
+
+    targets = target_group_hires(candidates, num_to_hire)
+    selected_counts = Counter(
+        _candidate_lookup(candidates)[candidate_id].demographic_group
+        for candidate_id in _unique_existing_ids(candidates, hired_ids)
+    )
+    optimal_total = sum(
+        candidate.ground_truth_score
+        for candidate in sorted(candidates, key=lambda item: item.ground_truth_score, reverse=True)[:num_to_hire]
+    )
+    selected_total = sum(
+        _candidate_lookup(candidates)[candidate_id].ground_truth_score
+        for candidate_id in _unique_existing_ids(candidates, hired_ids)
+    )
 
     breakdown = {
         "quality_score": q,
         "fairness_score": f,
         "alpha": alpha,
-        "num_hired": len(hired_ids),
+        "num_hired": len(_unique_existing_ids(candidates, hired_ids)),
         "num_to_hire": num_to_hire,
+        "selected_group_counts": dict(selected_counts),
+        "target_group_counts": targets,
+        "selected_cohort_value": round(selected_total, 4),
+        "optimal_cohort_value": round(optimal_total, 4),
         "formula": f"{alpha:.2f} * {q:.4f} + {1 - alpha:.2f} * {f:.4f} = {combined:.4f}",
     }
     if extra_info:
@@ -140,41 +168,78 @@ def compute_reward(
     return RewardInfo(
         quality_score=round(q, 4),
         fairness_score=round(f, 4),
-        combined_reward=round(float(np.clip(combined, 0.0, 1.0)), 4),
+        combined_reward=round(combined, 4),
         alpha=alpha,
         breakdown=breakdown,
     )
 
 
-def intermediate_reward(
+def compute_partial_reward(
     candidates: list[Candidate],
     hired_ids: list[int],
     rejected_ids: list[int],
+    interview_results: dict[int, float],
     num_to_hire: int,
     alpha: float,
     step: int,
-) -> float:
-    """
-    Compute a partial progress signal during the episode.
-    Gives the agent incremental feedback, not just end-of-episode.
-    """
-    if not hired_ids and not rejected_ids:
-        return 0.0
+    max_steps: int,
+    invalid_actions: int = 0,
+) -> RewardInfo:
+    """Compute dense trajectory reward while the episode is still running."""
 
-    # Partial quality signal from hires so far
-    if hired_ids:
-        sorted_cands = sorted(candidates, key=lambda c: c.ground_truth_score, reverse=True)
-        ideal_ids = set(c.id for c in sorted_cands[:num_to_hire])
-        good_hires = len(set(hired_ids) & ideal_ids)
-        partial_quality = good_hires / max(len(hired_ids), 1)
+    unique_hires = _unique_existing_ids(candidates, hired_ids)
+    unique_rejections = set(_unique_existing_ids(candidates, rejected_ids))
+    lookup = _candidate_lookup(candidates)
+
+    if unique_hires:
+        partial_optimal = sum(
+            candidate.ground_truth_score
+            for candidate in sorted(candidates, key=lambda item: item.ground_truth_score, reverse=True)[: len(unique_hires)]
+        )
+        partial_selected = sum(lookup[candidate_id].ground_truth_score for candidate_id in unique_hires)
+        partial_quality = _clamp(partial_selected / partial_optimal) if partial_optimal > 0 else 0.0
+        partial_fairness = fairness_score(candidates, unique_hires, num_to_hire=len(unique_hires))
     else:
         partial_quality = 0.0
+        partial_fairness = 0.0
 
-    # Partial fairness signal
-    partial_fairness = fairness_score(candidates, hired_ids) if hired_ids else 0.5
+    priority_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.ground_truth_score + 0.6 * candidate.calibration_risk + 0.2 * candidate.potential_score
+        ),
+        reverse=True,
+    )[: max(num_to_hire * 2, 4)]
+    priority_ids = {candidate.id for candidate in priority_candidates}
+    interview_coverage = (
+        len(priority_ids & set(interview_results.keys())) / max(len(priority_ids), 1)
+        if priority_ids
+        else 0.0
+    )
+    rejected_priority = len(priority_ids & unique_rejections) / max(len(priority_ids), 1)
+    efficiency_penalty = min(step / max(max_steps, 1), 1.0) * 0.08
+    invalid_penalty = min(invalid_actions * 0.10, 0.30)
 
-    # Small penalty for excessive steps (discourages loops)
-    step_penalty = max(0, step - 30) * 0.01
+    combined = (
+        alpha * partial_quality
+        + (1.0 - alpha) * partial_fairness
+        + 0.12 * interview_coverage
+        - 0.18 * rejected_priority
+        - efficiency_penalty
+        - invalid_penalty
+    )
 
-    partial = alpha * partial_quality + (1.0 - alpha) * partial_fairness - step_penalty
-    return round(float(np.clip(partial, 0.0, 1.0)), 4)
+    return RewardInfo(
+        quality_score=round(_clamp(partial_quality), 4),
+        fairness_score=round(_clamp(partial_fairness), 4),
+        combined_reward=round(_clamp(combined), 4),
+        alpha=alpha,
+        breakdown={
+            "type": "partial",
+            "step": step,
+            "interview_coverage": round(interview_coverage, 4),
+            "rejected_priority_fraction": round(rejected_priority, 4),
+            "invalid_actions": invalid_actions,
+            "efficiency_penalty": round(efficiency_penalty, 4),
+        },
+    )

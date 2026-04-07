@@ -1,33 +1,32 @@
 name: HireNFire
-short_description: "Bias-aware AI hiring screener with fairness rewards"
+short_description: "Structured hiring benchmark balancing candidate quality and cohort fairness"
 description: >
-  Bias-Aware Hiring Screener — an OpenEnv environment where an AI agent
-  screens resumes, conducts structured interviews, and makes hiring decisions.
-  Graded on both quality of hire (precision/recall) AND demographic fairness
-  (parity). The dual reward function reward = α·quality + (1−α)·fairness
-  creates a genuine tension that makes this environment scientifically interesting.
+  HireNFire is a real-world OpenEnv environment for structured hiring decisions.
+  An agent reviews candidate resumes, chooses who to interview, and finalizes a
+  hiring cohort. The final score combines cohort quality with fairness against
+  the applicant-pool mix, while intermediate rewards encourage interviewing the
+  right ambiguous candidates and penalize invalid or low-signal behavior.
 
 author: jagath-sajjan
-version: "1.0.0"
+version: "1.1.0"
 tags:
   - openenv
   - hiring
   - fairness
-  - ethics
-  - reinforcement-learning
+  - evaluation
+  - agent-benchmark
 
 observation_space:
   type: object
   description: >
-    Contains the candidate pool (resumes with skills, experience, education,
-    demographic group), current step number, task configuration, decisions
-    made so far, and remaining hiring slots.
+    Observation includes candidate cards, prior decisions, remaining slots,
+    fairness targets, revealed interview scores, and recent environment events.
 
 action_space:
   type: object
   description: >
-    Agent can RANK candidates, INTERVIEW a specific candidate for more info,
-    HIRE or REJECT a candidate, or FINALIZE to end the episode.
+    The agent may request a resume-only ranking, interview a candidate, hire,
+    reject, or finalize the slate.
   actions:
     - RANK
     - INTERVIEW
@@ -37,37 +36,39 @@ action_space:
 
 reward:
   description: >
-    Combined reward = α * quality_score + (1 - α) * fairness_score.
-    Quality is precision/recall of hires vs ground-truth top-K.
-    Fairness is demographic parity of hire decisions across groups.
+    Final reward = alpha * quality_score + (1 - alpha) * fairness_score.
+    Quality compares the selected cohort's hidden value to the optimal cohort.
+    Fairness compares selected group counts against pool-proportional targets.
+    Partial rewards add signal for useful interviews and penalize invalid or
+    wasteful trajectories.
 
 tasks:
   - id: easy
-    name: "Simple Ranking"
+    name: "simple-screen"
     description: >
-      Rank 10 candidates by explicit criteria for a Software Engineer role.
-      Clear skill gaps make the correct ranking obvious.
+      Fill three software engineering seats from a balanced pool where the best
+      resumes are mostly obvious but a few borderline candidates benefit from
+      interview calibration.
     difficulty: easy
     num_candidates: 10
-    alpha: 0.7
+    alpha: 0.72
 
   - id: medium
-    name: "High-Potential Screening"
+    name: "potential-calibration"
     description: >
-      Screen 25 candidates for a Data Scientist role. Some candidates are
-      underqualified on paper but show high potential. Agent must balance
-      strict criteria with potential.
+      Hire a data science cohort where some of the highest-value candidates are
+      career switchers or applicants whose interview performance is much better
+      than their resume alone suggests.
     difficulty: medium
     num_candidates: 25
-    alpha: 0.5
+    alpha: 0.55
 
   - id: hard
-    name: "Fair Hiring at Scale"
+    name: "fair-panel-hiring"
     description: >
-      Hire from a pool of 50 candidates for a Senior ML Engineer role.
-      The candidate pool has demographic skew and tight qualification margins.
-      Maintaining demographic parity while hiring quality candidates is
-      genuinely difficult.
+      Build a fair senior ML cohort from a larger, skewed pipeline where
+      polished resumes can outperform on paper while underrepresented groups
+      contain more hidden-upside candidates that require interviewing to find.
     difficulty: hard
     num_candidates: 50
-    alpha: 0.3
+    alpha: 0.38

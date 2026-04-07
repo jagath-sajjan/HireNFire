@@ -6,16 +6,18 @@ Bias-Aware Hiring Screener · OpenEnv · Meta x HF Hackathon
 from __future__ import annotations
 import json, os, random
 from collections import Counter
+from pathlib import Path
 from typing import Optional
 
 import gradio as gr
 import plotly.graph_objects as go
 import plotly.express as px
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from hirenfire import HiringEnv, Action, ActionType
-from hirenfire.models import Candidate
+from hirenfire.models import Candidate, EnvironmentState, Observation
 from hirenfire.tasks import EASY_TASK, MEDIUM_TASK, HARD_TASK, ALL_TASKS
 from hirenfire.graders import quality_score, fairness_score
 from hirenfire.generator import SKILL_POOLS
@@ -34,6 +36,8 @@ TASK_LABEL_TO_ID = {
     "Medium — High Potential Screening": "medium",
     "Hard — Fair Hiring at Scale": "hard",
 }
+
+_OPENENV_METADATA = yaml.safe_load(Path("openenv.yaml").read_text(encoding="utf-8"))
 
 def _get_env() -> HiringEnv:
     global _env
@@ -65,7 +69,7 @@ def _live_scores(env: HiringEnv):
         return r["quality_score"], r["fairness_score"], r["combined_reward"], True
     candidates = [Candidate(**c) for c in state["candidates"]]
     q = quality_score(candidates, hired, num_to_hire) if hired else 0.0
-    f = fairness_score(candidates, hired) if hired else 0.0
+    f = fairness_score(candidates, hired, num_to_hire=num_to_hire) if hired else 0.0
     return q, f, alpha * q + (1 - alpha) * f, False
 
 def _table_rows(env: HiringEnv) -> list[list]:
@@ -665,7 +669,7 @@ with gr.Blocks(title="HireNFire", css=CSS) as demo:
         <span style="background:rgba(20,184,166,.08);color:#2dd4bf;font-size:10px;padding:2px 8px;border-radius:5px;border:1px solid rgba(20,184,166,.15)">30% Fairness</span>
       </div>
       <div style="font-size:10.5px;color:#374151;line-height:1.5">
-        <span style="color:#4b5563;font-weight:600">Grader:</span> F1 vs ground truth top 3 + demographic parity distance
+        <span style="color:#4b5563;font-weight:600">Grader:</span> Cohort value ratio + pool-proportional fairness target
       </div>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid #1a2235;display:flex;gap:12px">
         <div><div style="font-size:15px;font-weight:700;color:#10b981">1.000</div><div style="font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:.08em">Quality</div></div>
@@ -703,7 +707,7 @@ with gr.Blocks(title="HireNFire", css=CSS) as demo:
         <span style="background:rgba(20,184,166,.08);color:#2dd4bf;font-size:10px;padding:2px 8px;border-radius:5px;border:1px solid rgba(20,184,166,.15)">50% Fairness</span>
       </div>
       <div style="font-size:10.5px;color:#374151;line-height:1.5">
-        <span style="color:#4b5563;font-weight:600">Grader:</span> F1 vs top 5 + demographic parity. Interview reveals hidden potential.
+        <span style="color:#4b5563;font-weight:600">Grader:</span> Cohort value ratio + fairness target matching. Interview reveals hidden potential.
       </div>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid #1a2235;display:flex;gap:12px">
         <div><div style="font-size:15px;font-weight:700;color:#10b981">0.800</div><div style="font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:.08em">Quality</div></div>
@@ -741,7 +745,7 @@ with gr.Blocks(title="HireNFire", css=CSS) as demo:
         <span style="background:rgba(20,184,166,.08);color:#2dd4bf;font-size:10px;padding:2px 8px;border-radius:5px;border:1px solid rgba(20,184,166,.15)">70% Fairness</span>
       </div>
       <div style="font-size:10.5px;color:#374151;line-height:1.5">
-        <span style="color:#4b5563;font-weight:600">Grader:</span> F1 vs top 8 + parity. Injected group A score boost makes this hard by design.
+        <span style="color:#4b5563;font-weight:600">Grader:</span> Cohort value ratio + fairness target matching under noisy resumes.
       </div>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid #1a2235;display:flex;gap:12px">
         <div><div style="font-size:15px;font-weight:700;color:#10b981">0.375</div><div style="font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:.08em">Quality</div></div>
@@ -760,10 +764,9 @@ with gr.Blocks(title="HireNFire", css=CSS) as demo:
         <div style="font-size:10px;color:#374151;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">Formula</div>
         <pre style="background:#060c1a;border:1px solid #1a2235;border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#86efac;margin:0;overflow-x:auto">R = α × quality + (1−α) × fairness
 
-quality  = F1(hired, ground_truth_top_K)
-         = 2·precision·recall / (P+R)
+quality  = selected_cohort_value / optimal_cohort_value
 
-fairness = 1 − (max_rate − min_rate)</pre>
+fairness = 1 − deviation_from_target_mix</pre>
       </div>
       <div style="font-size:12px;color:#4b5563;line-height:1.7">
         <div style="font-size:10px;color:#374151;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">Notes</div>
@@ -771,7 +774,7 @@ fairness = 1 − (max_rate − min_rate)</pre>
           <li style="display:flex;gap:8px"><span style="color:#818cf8;flex-shrink:0">›</span> Partial rewards emitted at every step not just episode end</li>
           <li style="display:flex;gap:8px"><span style="color:#818cf8;flex-shrink:0">›</span> Step penalty activates after step 30 to discourage infinite loops</li>
           <li style="display:flex;gap:8px"><span style="color:#818cf8;flex-shrink:0">›</span> INTERVIEW reveals a noisy score before HIRE / REJECT decisions</li>
-          <li style="display:flex;gap:8px"><span style="color:#818cf8;flex-shrink:0">›</span> Ground truth scores are hidden from the agent evaluator only</li>
+          <li style="display:flex;gap:8px"><span style="color:#818cf8;flex-shrink:0">›</span> Hidden cohort values remain private to the grader and state endpoint</li>
         </ul>
       </div>
     </div>
@@ -816,11 +819,70 @@ fairness = 1 − (max_rate − min_rate)</pre>
                     state_out     = gr.Code(language="json", label="Response")
                     api_state_btn.click(api_state, outputs=[state_out])
 
-# ─── FastAPI REST API (OpenEnv validator endpoints) ──────────────────────────
-# The OpenEnv platform checks POST /reset returns HTTP 200 with JSON.
-# We mount these as proper REST routes on the Gradio ASGI app.
+# ─── FastAPI REST API ────────────────────────────────────────────────────────
 
-app = FastAPI()
+app = FastAPI(
+    title="HireNFire",
+    description=_OPENENV_METADATA["description"],
+    version="1.1.0",
+)
+
+MCP_TOOLS = [
+    {
+        "name": "reset",
+        "description": "Reset the simulation and return the initial observation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "enum": sorted(_task_map.keys())},
+            },
+        },
+    },
+    {
+        "name": "step",
+        "description": "Execute an action against the environment.",
+        "inputSchema": Action.model_json_schema(),
+    },
+    {
+        "name": "state",
+        "description": "Fetch the current environment state.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _mcp_success(request_id, result):
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _mcp_error(request_id, code: int, message: str):
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+@app.get("/metadata")
+async def metadata():
+    """OpenEnv runtime metadata endpoint."""
+    return JSONResponse(
+        {
+            "name": _OPENENV_METADATA["name"],
+            "description": _OPENENV_METADATA["description"],
+            "version": "1.1.0",
+            "tasks": _OPENENV_METADATA["tasks"],
+            "benchmark": "hirenfire",
+        }
+    )
+
+
+@app.get("/schema")
+async def schema():
+    """OpenEnv runtime schema endpoint."""
+    return JSONResponse(
+        {
+            "action": Action.model_json_schema(),
+            "observation": Observation.model_json_schema(),
+            "state": EnvironmentState.model_json_schema(),
+        }
+    )
 
 
 @app.post("/reset")
@@ -834,11 +896,13 @@ async def rest_reset(request: Request):
             task_id = "easy"
         env = _reset_env(task_id)
         obs = env._make_observation()
-        return JSONResponse({
-            "status": "ok",
-            "task_id": task_id,
-            "observation": obs.model_dump(),
-        })
+        return JSONResponse(
+            {
+                "status": "ok",
+                "task_id": task_id,
+                "observation": obs.model_dump(mode="json"),
+            }
+        )
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
@@ -850,13 +914,15 @@ async def rest_step(request: Request):
         body = await request.body()
         data = json.loads(body)
         obs, reward, done, info = _get_env().step(Action(**data))
-        return JSONResponse({
-            "status": "ok",
-            "observation": obs.model_dump(),
-            "reward": reward.model_dump(),
-            "done": done,
-            "info": info,
-        })
+        return JSONResponse(
+            {
+                "status": "ok",
+                "observation": obs.model_dump(mode="json"),
+                "reward": reward.model_dump(mode="json"),
+                "done": done,
+                "info": info,
+            }
+        )
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
@@ -873,7 +939,68 @@ async def rest_state():
 @app.get("/health")
 async def health():
     """Health check."""
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "healthy", "benchmark": "hirenfire"})
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    """Minimal MCP-compatible JSON-RPC endpoint."""
+    try:
+        body = await request.body()
+        payload = json.loads(body) if body.strip() else {}
+    except json.JSONDecodeError:
+        return JSONResponse(_mcp_error(None, -32700, "Parse error"))
+
+    request_id = payload.get("id")
+    method = payload.get("method")
+    params = payload.get("params", {}) or {}
+
+    try:
+        if method == "initialize":
+            return JSONResponse(
+                _mcp_success(
+                    request_id,
+                    {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "hirenfire", "version": "1.1.0"},
+                    },
+                )
+            )
+        if method == "tools/list":
+            return JSONResponse(_mcp_success(request_id, {"tools": MCP_TOOLS}))
+        if method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {}) or {}
+            if tool_name == "reset":
+                task_id = arguments.get("task_id", "easy")
+                if task_id not in _task_map:
+                    task_id = "easy"
+                env = _reset_env(task_id)
+                result = {"task_id": task_id, "observation": env._make_observation().model_dump(mode="json")}
+            elif tool_name == "step":
+                obs, reward, done, info = _get_env().step(Action(**arguments))
+                result = {
+                    "observation": obs.model_dump(mode="json"),
+                    "reward": reward.model_dump(mode="json"),
+                    "done": done,
+                    "info": info,
+                }
+            elif tool_name == "state":
+                result = _get_env().state()
+            else:
+                return JSONResponse(_mcp_error(request_id, -32601, f"Unknown tool: {tool_name}"))
+
+            return JSONResponse(
+                _mcp_success(
+                    request_id,
+                    {"content": [{"type": "text", "text": json.dumps(result)}]},
+                )
+            )
+
+        return JSONResponse(_mcp_error(request_id, -32601, f"Method not found: {method}"))
+    except Exception as e:
+        return JSONResponse(_mcp_error(request_id, -32000, str(e)))
 
 
 # Mount Gradio onto the FastAPI app at root
