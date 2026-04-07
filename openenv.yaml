@@ -1,5 +1,5 @@
 name: HireNFire
-short_description: "Structured hiring benchmark balancing candidate quality and cohort fairness"
+short_description: "Hiring benchmark balancing quality and cohort fairness"
 description: >
   HireNFire is a real-world OpenEnv environment for structured hiring decisions.
   An agent reviews candidate resumes, chooses who to interview, and finalizes a

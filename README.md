@@ -12,7 +12,7 @@ tags:
   - llm-evaluation
   - simulation
 license: mit
-short_description: Structured hiring benchmark for quality and fairness aware agents
+short_description: Hiring benchmark for quality and fairness-aware agents
 pinned: false
 ---
 
