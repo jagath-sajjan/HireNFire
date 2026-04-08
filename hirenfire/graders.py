@@ -14,9 +14,22 @@ from collections import Counter
 
 from hirenfire.models import Candidate, RewardInfo
 
+STRICT_SCORE_EPSILON = 0.001
+
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def _strict_score(value: float) -> float:
+    """
+    Clamp benchmark scores to the open interval (0, 1).
+
+    The evaluator rejects exact 0.0 and 1.0 task scores, so final scorer values
+    need a small interior margin even when the underlying cohort is perfect.
+    """
+
+    return _clamp(value, STRICT_SCORE_EPSILON, 1.0 - STRICT_SCORE_EPSILON)
 
 
 def _candidate_lookup(candidates: list[Candidate]) -> dict[int, Candidate]:
@@ -88,7 +101,7 @@ def quality_score(
     )
     if optimal_total <= 0:
         return 0.0
-    return round(_clamp(selected_total / optimal_total), 4)
+    return round(_strict_score(selected_total / optimal_total), 4)
 
 
 def fairness_score(
@@ -120,7 +133,7 @@ def fairness_score(
     deviation = sum(abs(selected_counts.get(group, 0) - targets.get(group, 0)) for group in targets)
     fill_ratio = min(effective_hires / target_size, 1.0)
     mix_score = 1.0 - min(deviation / target_size, 1.0)
-    return round(_clamp(mix_score * fill_ratio), 4)
+    return round(_strict_score(mix_score * fill_ratio), 4)
 
 
 def compute_reward(
@@ -134,7 +147,7 @@ def compute_reward(
 
     q = quality_score(candidates, hired_ids, num_to_hire)
     f = fairness_score(candidates, hired_ids, num_to_hire=num_to_hire)
-    combined = _clamp(alpha * q + (1.0 - alpha) * f)
+    combined = _strict_score(alpha * q + (1.0 - alpha) * f)
 
     targets = target_group_hires(candidates, num_to_hire)
     selected_counts = Counter(
@@ -166,8 +179,8 @@ def compute_reward(
         breakdown.update(extra_info)
 
     return RewardInfo(
-        quality_score=round(q, 4),
-        fairness_score=round(f, 4),
+        quality_score=round(_strict_score(q), 4),
+        fairness_score=round(_strict_score(f), 4),
         combined_reward=round(combined, 4),
         alpha=alpha,
         breakdown=breakdown,
@@ -197,11 +210,11 @@ def compute_partial_reward(
             for candidate in sorted(candidates, key=lambda item: item.ground_truth_score, reverse=True)[: len(unique_hires)]
         )
         partial_selected = sum(lookup[candidate_id].ground_truth_score for candidate_id in unique_hires)
-        partial_quality = _clamp(partial_selected / partial_optimal) if partial_optimal > 0 else 0.0
+        partial_quality = _strict_score(partial_selected / partial_optimal) if partial_optimal > 0 else STRICT_SCORE_EPSILON
         partial_fairness = fairness_score(candidates, unique_hires, num_to_hire=len(unique_hires))
     else:
-        partial_quality = 0.0
-        partial_fairness = 0.0
+        partial_quality = STRICT_SCORE_EPSILON
+        partial_fairness = STRICT_SCORE_EPSILON
 
     priority_candidates = sorted(
         candidates,
@@ -230,9 +243,9 @@ def compute_partial_reward(
     )
 
     return RewardInfo(
-        quality_score=round(_clamp(partial_quality), 4),
-        fairness_score=round(_clamp(partial_fairness), 4),
-        combined_reward=round(_clamp(combined), 4),
+        quality_score=round(_strict_score(partial_quality), 4),
+        fairness_score=round(_strict_score(partial_fairness), 4),
+        combined_reward=round(_strict_score(combined), 4),
         alpha=alpha,
         breakdown={
             "type": "partial",
